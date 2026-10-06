@@ -9,7 +9,7 @@ on:
       - "Harmony.py"
       - "harmony.ico"
       - "requirements.txt"
-      - ".github/workflows/workflow.yaml"
+      - ".github/workflows/main.yml"
 
 permissions:
   contents: read
@@ -50,6 +50,7 @@ jobs:
           --include-data-files=harmony.ico=harmony.ico
           --include-package=yt_dlp
           --jobs=1
+          --assume-yes-for-downloads
           --output-dir=build
           Harmony.py
 
