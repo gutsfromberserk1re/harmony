@@ -10,3 +10,9 @@
   <br />
   <img width="850" height="510" alt="image 2" src="https://github.com/user-attachments/assets/bd067dac-df02-4719-bac7-fdceb7287c22" />
 </p>
+
+# how to change themes 
+
+**left click** on butterfly to pull up playlists
+
+**right click** to change themes and transparency level 
