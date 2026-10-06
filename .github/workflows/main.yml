@@ -39,17 +39,22 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
 
-      # Cache Nuitka's C/C++ compiler cache across workflow runs
+      # Restore/Save compiler cache inside project workspace
       - name: Restore Nuitka Compiler Cache
         uses: actions/cache@v4
         with:
-          path: ~/.cache/Nuitka
+          path: |
+            .nuitka-cache
+            .clcache
           key: nuitka-${{ runner.os }}-${{ hashFiles('requirements.txt') }}-${{ github.sha }}
           restore-keys: |
             nuitka-${{ runner.os }}-${{ hashFiles('requirements.txt') }}-
             nuitka-${{ runner.os }}-
 
       - name: Build one-file executable with Nuitka and MSVC
+        env:
+          NUITKA_CACHE_DIR: ${{ github.workspace }}/.nuitka-cache
+          CLCACHE_DIR: ${{ github.workspace }}/.clcache
         run: >
           python -m nuitka
           --onefile
