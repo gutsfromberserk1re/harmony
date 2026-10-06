@@ -17,7 +17,7 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 15
 
     steps:
       - name: Check out repository
@@ -37,53 +37,44 @@ jobs:
           if (!(Test-Path "harmony.ico")) { throw "harmony.ico was not found in the repository root." }
 
       - name: Install dependencies
-        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
 
-      # Restore/Save compiler cache inside project workspace
-      - name: Restore Nuitka Compiler Cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            .nuitka-cache
-            .clcache
-          key: nuitka-${{ runner.os }}-${{ hashFiles('requirements.txt') }}-${{ github.sha }}
-          restore-keys: |
-            nuitka-${{ runner.os }}-${{ hashFiles('requirements.txt') }}-
-            nuitka-${{ runner.os }}-
-
-      - name: Build one-file executable with Nuitka and MSVC
-        env:
-          NUITKA_CACHE_DIR: ${{ github.workspace }}/.nuitka-cache
-          CLCACHE_DIR: ${{ github.workspace }}/.clcache
+      - name: Build one-file executable with PyInstaller
         run: >
-          python -m nuitka
-          --onefile
-          --msvc=latest
-          --enable-plugin=pyside6
-          --windows-console-mode=disable
-          --windows-icon-from-ico=harmony.ico
-          --include-data-files=harmony.ico=harmony.ico
-          --include-package=yt_dlp
-          --include-module=certifi
-          --include-package-data=certifi
-          --jobs=2
-          --assume-yes-for-downloads
-          --output-dir=build
+          pyinstaller
+          --noconfirm
+          --onedir
+          --windowed
+          --icon=harmony.ico
+          --add-data "harmony.ico;."
+          --collect-all yt_dlp
+          --collect-all certifi
+          --distpath dist
+          --workpath build
+          --name Harmony
           Harmony.py
 
-      - name: Verify executable was created
+      # Create a portable single ZIP file containing the bundle
+      - name: Create Portable Zip
         shell: pwsh
         run: |
-          if (!(Test-Path "build/Harmony.exe")) {
-            Get-ChildItem -Recurse build -ErrorAction SilentlyContinue
-            throw "Build finished without producing build/Harmony.exe."
-          }
-          Get-Item "build/Harmony.exe" | Select-Object FullName, Length
+          Compress-Archive -Path "dist/Harmony/*" -DestinationPath "dist/Harmony-Windows-x64.zip"
 
-      - name: Upload Harmony EXE
+      - name: Verify ZIP was created
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist/Harmony-Windows-x64.zip")) {
+            throw "Build finished without producing Harmony-Windows-x64.zip"
+          }
+          Get-Item "dist/Harmony-Windows-x64.zip" | Select-Object FullName, Length
+
+      - name: Upload Harmony Zip Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Harmony-Windows-x64
-          path: build/Harmony.exe
+          path: dist/Harmony-Windows-x64.zip
           if-no-files-found: error
           retention-days: 14
