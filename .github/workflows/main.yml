@@ -48,7 +48,7 @@ jobs:
           --windows-console-mode=disable
           --windows-icon-from-ico=harmony.ico
           --include-data-files=harmony.ico=harmony.ico
-          --include-package=yt_dlp
+          --low-memory
           --jobs=1
           --assume-yes-for-downloads
           --output-dir=build
