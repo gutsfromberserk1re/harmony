@@ -1,1 +1,71 @@
+name: Build Harmony EXE
 
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "Harmony.py"
+      - "harmony.ico"
+      - "requirements.txt"
+      - ".github/workflows/workflow.yaml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Verify required project files
+        shell: pwsh
+        run: |
+          if (!(Test-Path "Harmony.py")) { throw "Harmony.py was not found in the repository root." }
+          if (!(Test-Path "harmony.ico")) { throw "harmony.ico was not found in the repository root." }
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+      - name: Build one-file executable with Nuitka and MSVC
+        run: >
+          python -m nuitka
+          --onefile
+          --msvc=latest
+          --enable-plugin=pyside6
+          --windows-console-mode=disable
+          --windows-icon-from-ico=harmony.ico
+          --include-data-files=harmony.ico=harmony.ico
+          --include-package=yt_dlp
+          --jobs=1
+          --output-dir=build
+          Harmony.py
+
+      - name: Verify executable was created
+        shell: pwsh
+        run: |
+          if (!(Test-Path "build/Harmony.exe")) {
+            Get-ChildItem -Recurse build -ErrorAction SilentlyContinue
+            throw "Build finished without producing build/Harmony.exe."
+          }
+          Get-Item "build/Harmony.exe" | Select-Object FullName, Length
+
+      - name: Upload Harmony EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: Harmony-Windows-x64
+          path: build/Harmony.exe
+          if-no-files-found: error
+          retention-days: 14
