@@ -52,7 +52,7 @@ jobs:
           --include-package-data=certifi
           --low-memory
           --lto=no
-          --jobs=1
+          --jobs=2
           --assume-yes-for-downloads
           --output-dir=build
           Harmony.py
