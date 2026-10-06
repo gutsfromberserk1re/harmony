@@ -17,7 +17,7 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Check out repository
@@ -42,39 +42,34 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install pyinstaller
 
-      - name: Build one-file executable with PyInstaller
+      - name: Build single-file executable with PyInstaller
         run: >
           pyinstaller
           --noconfirm
-          --onedir
+          --onefile
           --windowed
           --icon=harmony.ico
           --add-data "harmony.ico;."
           --collect-all yt_dlp
           --collect-all certifi
-          --distpath dist
-          --workpath build
+          --distpath build
+          --workpath build/spec
           --name Harmony
           Harmony.py
 
-      # Create a portable single ZIP file containing the bundle
-      - name: Create Portable Zip
+      - name: Verify executable was created
         shell: pwsh
         run: |
-          Compress-Archive -Path "dist/Harmony/*" -DestinationPath "dist/Harmony-Windows-x64.zip"
-
-      - name: Verify ZIP was created
-        shell: pwsh
-        run: |
-          if (!(Test-Path "dist/Harmony-Windows-x64.zip")) {
-            throw "Build finished without producing Harmony-Windows-x64.zip"
+          if (!(Test-Path "build/Harmony.exe")) {
+            Get-ChildItem -Recurse build -ErrorAction SilentlyContinue
+            throw "Build finished without producing build/Harmony.exe."
           }
-          Get-Item "dist/Harmony-Windows-x64.zip" | Select-Object FullName, Length
+          Get-Item "build/Harmony.exe" | Select-Object FullName, Length
 
-      - name: Upload Harmony Zip Artifact
+      - name: Upload Harmony EXE Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Harmony-Windows-x64
-          path: dist/Harmony-Windows-x64.zip
+          path: build/Harmony.exe
           if-no-files-found: error
           retention-days: 14
