@@ -64,6 +64,7 @@ jobs:
           --windows-icon-from-ico=harmony.ico
           --include-data-files=harmony.ico=harmony.ico
           --include-package=yt_dlp
+          --include-module=certifi
           --include-package-data=certifi
           --jobs=2
           --assume-yes-for-downloads
