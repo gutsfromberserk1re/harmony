@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QMenu, QDialog, QLineEdit, QSlider, QTreeWidget,
     QTreeWidgetItem, QGraphicsDropShadowEffect, QStyle, QSizePolicy, QAbstractItemView
 )
-from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QMediaDevices
 
 SIDEBAR_WIDTH = 210
 MAX_RETRIES = 5                 # consecutive failures (while online) before a track is skipped
@@ -49,6 +49,9 @@ COOKIES_BROWSER = ""            # OPTIONAL manual override: "firefox", "chrome",
                                 # automatically borrows the login of a browser you're signed in to.
 AUTO_COOKIE_BROWSERS = ("firefox", "chrome", "edge", "brave")
 AUTO_COOKIE_COOLDOWN_S = 600    # after every browser failed, don't retry the fallback for this long
+
+DISCORD_CLIENT_ID = "1559860475662176308"          # Discord "Application ID" (discord.com/developers/applications). "" = Discord status off
+DISCORD_ICON_KEY = "harmony"    # name of the icon you upload under Rich Presence > Art Assets
 USE_YTDLP_EXE = False           # True = run a bundled yt-dlp.exe as a subprocess (lowest RAM, slower track start)
 
 
@@ -957,6 +960,115 @@ class CustomTitleBar(QWidget):
         """)
 
 
+# ----------------------------------------------------------------- discord rich presence
+
+class DiscordPresence:
+    """Shows the current song on your Discord profile. Runs on its own thread, so Discord being
+    closed, slow or rate-limiting can never freeze the player. Needs: pip install pypresence"""
+    MIN_INTERVAL = 4.0          # Discord allows ~5 updates per 20 s
+    RECONNECT_S = 15.0          # how often to retry while Discord isn't running
+
+    def __init__(self, client_id):
+        self.client_id = str(client_id or "").strip()
+        self.enabled = bool(self.client_id)
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._want = None           # activity dict, or None = show nothing
+        self._sent = None
+        self._stop = False
+        self._rpc = None
+        if self.enabled:
+            threading.Thread(target=self._run, daemon=True).start()
+
+    def set(self, activity):
+        if not self.enabled:
+            return
+        with self._lock:
+            self._want = activity
+        self._wake.set()
+
+    def stop(self):
+        self._stop = True
+        self._wake.set()
+
+    @staticmethod
+    def _similar(a, b):
+        if a is None or b is None:
+            return a is b
+        def core(d):
+            return {k: v for k, v in d.items() if k not in ("start", "end")}
+        if core(a) != core(b):
+            return False
+        for k in ("start", "end"):
+            x, y = a.get(k), b.get(k)
+            if (x is None) != (y is None) or (x is not None and abs(x - y) > 3):
+                return False
+        return True
+
+    def _run(self):
+        try:
+            import asyncio
+            from pypresence import Presence
+        except Exception:
+            self.enabled = False            # pypresence not installed: silently disable
+            return
+        last_send = 0.0
+        while True:
+            self._wake.wait(timeout=self.RECONNECT_S)
+            self._wake.clear()
+            if self._stop:
+                break
+            with self._lock:
+                want = self._want
+            if self._similar(want, self._sent):
+                continue
+            gap = last_send + self.MIN_INTERVAL - time.monotonic()
+            if gap > 0:
+                time.sleep(gap)
+                with self._lock:
+                    want = self._want       # use the newest state after waiting
+            try:
+                if self._rpc is None:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    rpc = Presence(self.client_id, loop=loop)
+                    rpc.connect()
+                    self._rpc = rpc
+                if want is None:
+                    self._rpc.clear()
+                else:
+                    self._push(want)
+                self._sent = want
+                last_send = time.monotonic()
+            except Exception:
+                self._drop()                # Discord closed / pipe broke: retry on the next wake-up
+        self._drop(clear=True)
+
+    def _push(self, activity):
+        kw = {k: v for k, v in activity.items() if v is not None}
+        try:
+            from pypresence import ActivityType
+            kw["activity_type"] = ActivityType.LISTENING      # "Listening to Harmony"
+        except Exception:
+            pass
+        try:
+            self._rpc.update(**kw)
+        except TypeError:                   # older pypresence without activity_type
+            kw.pop("activity_type", None)
+            self._rpc.update(**kw)
+
+    def _drop(self, clear=False):
+        rpc, self._rpc = self._rpc, None
+        self._sent = None                   # force a full re-send after reconnecting
+        if rpc is not None:
+            try:
+                if clear:
+                    rpc.clear()
+                rpc.close()
+            except Exception:
+                pass
+
+
 # ----------------------------------------------------------------- main window
 
 class AudioPlayer(QWidget):
@@ -994,6 +1106,7 @@ class AudioPlayer(QWidget):
         self._end_handled = False       # guards against double "track ended" handling
         self._fail_count = 0
         self._skip_streak = 0
+        self.queue_playlist = ""        # name of the playlist the queue came from (for Discord)
 
         self._last_sec = -1
         self._rainbow_ticks = 0
@@ -1002,6 +1115,9 @@ class AudioPlayer(QWidget):
         self.bridge = Bridge(self)
         self.bridge.playlist_ready.connect(self.populate_tracks)
         self.bridge.stream_ready.connect(self.start_stream)
+
+        self.discord_on = self.settings.value("discord_rpc", True, type=bool)
+        self.presence = DiscordPresence(DISCORD_CLIENT_ID)
 
         self.media_player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
@@ -1026,6 +1142,15 @@ class AudioPlayer(QWidget):
         self._watchdog.setInterval(1000)
         self._watchdog.timeout.connect(self._watchdog_tick)
         self._watchdog.start()
+
+        # headphones / speakers plugged or unplugged: re-bind the output and resume in place
+        self._user_paused = False
+        self._device_grace_until = 0.0
+        self._device_timer = QTimer(self)
+        self._device_timer.setSingleShot(True)
+        self._device_timer.timeout.connect(self._rebind_audio)
+        self.media_devices = QMediaDevices(self)
+        self.media_devices.audioOutputsChanged.connect(self._on_audio_devices_changed)
 
         self.setup_window()
         self.enable_window_blur_and_corners()
@@ -1283,6 +1408,7 @@ class AudioPlayer(QWidget):
 
     def closeEvent(self, event):
         self._active = False
+        self.presence.stop()
         self._watchdog.stop()
         self._retry_timer.stop()
         self.media_player.stop()
@@ -1438,6 +1564,12 @@ class AudioPlayer(QWidget):
             a.setChecked(alpha == self.bg_alpha)
             a.triggered.connect(lambda c=False, al=alpha: self.set_transparency(al))
 
+        if self.presence.enabled:
+            a = menu.addAction("💬 Discord Status")
+            a.setCheckable(True)
+            a.setChecked(self.discord_on)
+            a.triggered.connect(lambda c=False: self.toggle_discord())
+
         menu.exec(global_pos)
         menu.deleteLater()                  # parented menus are otherwise never freed
 
@@ -1537,6 +1669,7 @@ class AudioPlayer(QWidget):
         row = index.row()
         if self.tracks and 0 <= row < len(self.tracks):
             self.queue = self.tracks
+            self.queue_playlist = self.current_playlist_name
             self._skip_streak = 0
             self._reset_shuffle()
             self.play_track(row)
@@ -1562,6 +1695,7 @@ class AudioPlayer(QWidget):
         self._last_progress = time.monotonic()
         self._load_started = time.monotonic()
         self._end_handled = False
+        self._user_paused = False
         self._active = True
         self._resolving = True
         self._loading = True
@@ -1588,6 +1722,7 @@ class AudioPlayer(QWidget):
         self._last_progress = now
         self.media_player.setSource(QUrl(stream_url))
         self.media_player.play()
+        self._refresh_presence()
 
     # ---- recovery
 
@@ -1631,6 +1766,11 @@ class AudioPlayer(QWidget):
         if self._is_near_end(self._last_pos):
             self._handle_track_end()
             return
+        if time.monotonic() < self._device_grace_until:
+            # audio device just changed: not a network problem, so don't count it as a failure
+            if not self._device_timer.isActive():
+                self._device_timer.start(500)
+            return
         self._fail_count += 1
         if self._fail_count >= MAX_RETRIES:
             self._give_up_track()
@@ -1661,8 +1801,34 @@ class AudioPlayer(QWidget):
             self._last_progress = time.monotonic()
             self.media_player.setPosition(0)
             self.media_player.play()
+            self._refresh_presence()
         else:
             self.play_next()
+
+    # ---- audio device changes (headphones connecting / disconnecting)
+
+    def _on_audio_devices_changed(self):
+        self._device_grace_until = time.monotonic() + 8
+        self._device_timer.start(700)           # debounce: Windows fires several events per change
+
+    def _rebind_audio(self):
+        try:
+            default = QMediaDevices.defaultAudioOutput()
+            if self.audio_output.device() != default:
+                self.audio_output.setDevice(default)
+        except Exception:
+            pass
+        if not self._active or self._user_paused or self._resolving or self._retry_timer.isActive():
+            return
+        PS = QMediaPlayer.PlaybackState
+        st = self.media_player.playbackState()
+        if st == PS.PlayingState:
+            return
+        if st == PS.PausedState:                # the system paused us when the device vanished
+            self.media_player.play()
+        elif 0 <= self.current_index < len(self.queue):
+            # stopped: reopen the stream and continue from where we were (not from 0:00)
+            self.play_track(self.current_index, resume_ms=self._last_pos, retry=True)
 
     def _check_stopped(self):
         if (not self._active or self._resolving or self._loading or self._end_handled
@@ -1736,21 +1902,69 @@ class AudioPlayer(QWidget):
             self._clear_glow()
             if state == PS.StoppedState and self._active:
                 QTimer.singleShot(700, self._check_stopped)
+        self._refresh_presence()
 
     def toggle_play(self):
         state = self.media_player.playbackState()
         if state == QMediaPlayer.PlaybackState.PlayingState:
+            self._user_paused = True
             self.media_player.pause()
         elif state == QMediaPlayer.PlaybackState.PausedState:
+            self._user_paused = False
             self.media_player.play()
         elif self.queue and self.current_index >= 0:
             self._skip_streak = 0
-            self.play_track(self.current_index)
+            resume = self._last_pos if (self._active and not self._is_near_end(self._last_pos)) else 0
+            self.play_track(self.current_index, resume_ms=resume)
         elif self.tracks:
             self.queue = self.tracks
+            self.queue_playlist = self.current_playlist_name
             self._skip_streak = 0
             self._reset_shuffle()
             self.play_track(0)
+
+    # ---- discord status
+
+    def _refresh_presence(self):
+        """Tell Discord what is playing (title, thumbnail, playlist, progress bar)."""
+        if not self.presence.enabled:
+            return
+        if not self.discord_on or not self._active or not (0 <= self.current_index < len(self.queue)):
+            self.presence.set(None)
+            return
+        PS = QMediaPlayer.PlaybackState
+        st = self.media_player.playbackState()
+        if st == PS.StoppedState:
+            return                          # between tracks / reconnecting: keep what is shown
+        track = self.queue[self.current_index]
+        vid, title = track[0], (track[1] or "Unknown Track")[:120]
+        if len(title) < 2:
+            title += " \u266a"
+        playlist = self.queue_playlist
+        act = {
+            "details": title,
+            "state": (playlist[:100] if len(playlist) >= 2 else "Harmony"),
+            "large_image": f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg",     # video thumbnail
+            "large_text": title,
+            "small_image": DISCORD_ICON_KEY,                                    # Harmony icon
+            "small_text": "Harmony",
+            "buttons": [{"label": "Listen on YouTube",
+                         "url": f"https://www.youtube.com/watch?v={vid}"}],
+        }
+        if st == PS.PlayingState:
+            length = self._expected_ms or self.media_player.duration()
+            start = int(time.time()) - self._last_pos // 1000
+            act["start"] = start
+            if length > 0:
+                act["end"] = start + length // 1000
+        else:
+            act["state"] = ("Paused \u00b7 " + playlist)[:120] if len(playlist) >= 2 else "Paused"
+        self.presence.set(act)
+
+    def toggle_discord(self):
+        self.discord_on = not self.discord_on
+        self.settings.setValue("discord_rpc", self.discord_on)
+        self._refresh_presence()
 
     # ---- next / previous / shuffle / repeat
 
@@ -1832,6 +2046,7 @@ class AudioPlayer(QWidget):
         self._last_pos = target
         self._resume_floor = 0
         self.media_player.setPosition(target)
+        self._refresh_presence()
 
     def on_slider_moved(self, value):
         self.time_current.setText(fmt_time(value // 1000))
@@ -1841,6 +2056,7 @@ class AudioPlayer(QWidget):
         self._last_pos = target
         self._resume_floor = 0
         self.media_player.setPosition(target)
+        self._refresh_presence()
 
     def update_position(self, position):
         if position != self._watch_pos:
@@ -1849,7 +2065,8 @@ class AudioPlayer(QWidget):
         if position > 0:
             self._loading = False
         # after a reconnect, ignore the temporary 0:00 until the resume seek lands
-        if position + 3000 >= self._resume_floor:
+        # a sudden 0:00 is the player resetting itself (device lost, stop), not real progress
+        if position + 3000 >= self._resume_floor and not (position == 0 and self._last_pos > 3000):
             self._last_pos = position
             self._resume_floor = 0
         if not self.progress_slider.isSliderDown():
@@ -1867,6 +2084,8 @@ class AudioPlayer(QWidget):
     def update_duration(self, duration):
         self.progress_slider.setRange(0, max(0, duration))
         self.time_total.setText(fmt_time(duration // 1000))
+        if duration > 0 and not self._expected_ms:
+            self._refresh_presence()
 
 
 if __name__ == "__main__":
