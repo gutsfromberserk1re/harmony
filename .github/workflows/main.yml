@@ -9,19 +9,27 @@ on:
       - "Harmony.py"
       - "harmony.ico"
       - "requirements.txt"
-      - ".github/workflows/main.yml"
 
 permissions:
   contents: read
+
+# Never run two builds at once, otherwise two releases could race for the same version number
+concurrency:
+  group: harmony-release
+  cancel-in-progress: false
 
 jobs:
   build-windows:
     runs-on: windows-latest
     timeout-minutes: 20
+    permissions:
+      contents: write          # needed to create tags and releases
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0       # full history so existing version tags are visible
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -73,3 +81,79 @@ jobs:
           path: build/Harmony.exe
           if-no-files-found: error
           retention-days: 14
+
+      - name: Work out next version (1.0 -> 1.1 -> 1.2 ...)
+        id: version
+        shell: pwsh
+        run: |
+          git fetch --tags --force
+          $latest = [version]"1.0"              # the current version, used when no tag exists yet
+          foreach ($t in (git tag --list "v*")) {
+            if ($t -match '^v(\d+)\.(\d+)$') {
+              $v = [version]"$($Matches[1]).$($Matches[2])"
+              if ($v -gt $latest) { $latest = $v }
+            }
+          }
+          $next = "$($latest.Major).$($latest.Minor + 1)"
+          Write-Host "Latest: $latest  ->  Next: $next"
+          "version=$next" >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "v${{ steps.version.outputs.version }}"
+          gh release create $tag build/Harmony.exe `
+            --target "${{ github.sha }}" `
+            --title "Harmony $tag" `
+            --generate-notes
+
+      - name: Update README download button
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        run: |
+          $repo = "${{ github.repository }}"
+          $ver  = "v${{ steps.version.outputs.version }}"
+          $url  = "https://github.com/$repo/releases/latest/download/Harmony.exe"
+          $rel  = "https://github.com/$repo/releases/latest"
+
+          $block = @"
+          <!-- DOWNLOAD:START -->
+          <p align="center">
+            <a href="$url"><img src="https://img.shields.io/badge/Download-Harmony_$ver-ff6b9d?style=for-the-badge&logo=windows&logoColor=white&labelColor=1a1a1f" alt="Download Harmony $ver"></a>
+          </p>
+          <p align="center">
+            <sub>Windows 10/11 &middot; x64 &middot; single-file EXE &middot; <a href="$rel">release notes</a></sub>
+          </p>
+          <!-- DOWNLOAD:END -->
+          "@
+          # strip the YAML indentation from the here-string
+          $block = (($block -split "`n") | ForEach-Object { $_.TrimStart() }) -join "`n"
+          $block = $block.TrimEnd()
+
+          $text = if (Test-Path "README.md") { [System.IO.File]::ReadAllText("README.md") } else { "" }
+          $pattern = '(?s)<!-- DOWNLOAD:START -->.*?<!-- DOWNLOAD:END -->'
+
+          if ($text -match $pattern) {
+            $text = [regex]::Replace($text, $pattern, { param($m) $block })
+          } else {
+            # first run: place the button right under the title
+            $nl = $text.IndexOf("`n")
+            if ($text.StartsWith("#") -and $nl -ge 0) {
+              $text = $text.Substring(0, $nl + 1) + "`n" + $block + "`n" + $text.Substring($nl + 1)
+            } else {
+              $text = $block + "`n`n" + $text
+            }
+          }
+          [System.IO.File]::WriteAllText("README.md", $text, (New-Object System.Text.UTF8Encoding $false))
+
+          git diff --quiet -- README.md
+          if ($LASTEXITCODE -eq 0 -and (git ls-files README.md)) { Write-Host "README already up to date"; exit 0 }
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "docs: update download button to $ver [skip ci]"
+          git pull --rebase origin main
+          git push origin HEAD:main
