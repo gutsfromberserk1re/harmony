@@ -10,6 +10,7 @@ import math
 import time
 import random
 import ctypes
+import socket
 import functools
 import importlib
 import subprocess
@@ -32,11 +33,22 @@ from PySide6.QtWidgets import (
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 SIDEBAR_WIDTH = 210
-MAX_RETRIES = 3
+MAX_RETRIES = 5                 # consecutive failures (while online) before a track is skipped
+RETRY_DELAYS = (0, 1000, 2500, 5000, 8000)   # ms between recovery attempts
+OFFLINE_POLL_MS = 3000          # how often to retry while there is no internet
+END_TOLERANCE_MS = 4000         # within this of the end = the song really finished
+STALL_TIMEOUT_S = 12            # playing but no progress for this long = stalled stream
+LOAD_TIMEOUT_S = 25             # source set but never started playing
 RAINBOW_CYCLE_SEC = 60          # time for the Rainbow theme to go around the whole color wheel
 RAINBOW_STYLE_EVERY = 8         # re-apply stylesheets every N rainbow ticks (200 ms each)
 
 TRIM_EXTRACTORS = True          # load only the YouTube extractors (big RAM saver); False = stock yt-dlp
+COOKIES_BROWSER = ""            # OPTIONAL manual override: "firefox", "chrome", "edge", ... ("" = automatic).
+                                # Or put a cookies.txt (Netscape format) next to this script.
+                                # Normally you need neither: if YouTube shows its bot check, the app
+                                # automatically borrows the login of a browser you're signed in to.
+AUTO_COOKIE_BROWSERS = ("firefox", "chrome", "edge", "brave")
+AUTO_COOKIE_COOLDOWN_S = 600    # after every browser failed, don't retry the fallback for this long
 USE_YTDLP_EXE = False           # True = run a bundled yt-dlp.exe as a subprocess (lowest RAM, slower track start)
 
 
@@ -92,6 +104,7 @@ def resource_path(relative_path):
 ICON_PATH = resource_path("harmony.ico")
 HAS_ICON = os.path.exists(ICON_PATH)
 YTDLP_EXE = resource_path("yt-dlp.exe")
+COOKIES_FILE = resource_path("cookies.txt")
 USE_EXE = USE_YTDLP_EXE and os.path.exists(YTDLP_EXE)
 
 _icon_cache = []
@@ -125,6 +138,26 @@ def fmt_time(seconds):
     h, rem = divmod(int(seconds), 3600)
     m, s = divmod(rem, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def _is_online(timeout=1.2):
+    """Quick connectivity probe (worker threads only). Probes in parallel, returns on first success."""
+    result = []
+    done = threading.Event()
+
+    def probe(addr):
+        try:
+            socket.create_connection(addr, timeout).close()
+            result.append(True)
+            done.set()
+        except OSError:
+            pass
+
+    addrs = (("1.1.1.1", 443), ("8.8.8.8", 53), ("www.youtube.com", 443))
+    for a in addrs:
+        threading.Thread(target=probe, args=(a,), daemon=True).start()
+    done.wait(timeout + 0.3)
+    return bool(result)
 
 
 _ws_ready = False
@@ -180,9 +213,10 @@ class Bridge(QObject):
     """Hands results from worker threads to the Qt main thread.
     playlist_req / stream_req hold the newest request ids so workers can skip stale work."""
     playlist_ready = Signal(int, list)
-    stream_ready = Signal(int, str)
+    stream_ready = Signal(int, str, bool)      # req, url, offline
     playlist_req = 0
     stream_req = 0
+    auth_blocked = False        # YouTube demanded a sign-in / bot check on the last lookup
 
 
 _COMMON_OPTS = {
@@ -190,6 +224,16 @@ _COMMON_OPTS = {
     'socket_timeout': 15, 'retries': 3,
     'extractor_args': {'youtube': {'skip': ['translated_subs']}},
 }
+if os.path.exists(COOKIES_FILE):
+    _COMMON_OPTS['cookiefile'] = COOKIES_FILE
+elif COOKIES_BROWSER:
+    _COMMON_OPTS['cookiesfrombrowser'] = (COOKIES_BROWSER,)
+if os.path.exists(COOKIES_FILE):
+    _COOKIE_ARGS = ["--cookies", COOKIES_FILE]
+elif COOKIES_BROWSER:
+    _COOKIE_ARGS = ["--cookies-from-browser", COOKIES_BROWSER]
+else:
+    _COOKIE_ARGS = []
 PLAYLIST_OPTS = dict(_COMMON_OPTS, extract_flat='in_playlist', skip_download=True, ignoreerrors=True)
 STREAM_OPTS = dict(_COMMON_OPTS, format='bestaudio/best', noplaylist=True)
 
@@ -278,13 +322,55 @@ def _run_exe(args, timeout):
     return r.stdout.decode("utf-8", "replace")
 
 
+_EXPLICIT_COOKIES = bool(os.path.exists(COOKIES_FILE) or COOKIES_BROWSER)
+_cookie_browser = None          # browser whose cookies worked last time
+_cookie_fail_time = 0.0
+_stream_ydls = {}               # cookie browser (or None) -> reusable YoutubeDL
+
+
+def _is_bot_error(e):
+    msg = str(e).lower()
+    return "confirm you" in msg and "bot" in msg
+
+
+def _with_cookie_fallback(run):
+    """run(extra_opts) -> result. Tries without cookies; if YouTube shows the bot check,
+    retries with cookies borrowed from an installed browser (remembered once one works)."""
+    global _cookie_browser, _cookie_fail_time
+    if _cookie_browser:
+        try:
+            return run({'cookiesfrombrowser': (_cookie_browser,)})
+        except Exception as e:
+            if not _is_bot_error(e):
+                raise
+            _cookie_browser = None              # cookies expired / signed out: search again
+    try:
+        return run({})
+    except Exception as e:
+        if (not _is_bot_error(e) or _EXPLICIT_COOKIES
+                or time.monotonic() - _cookie_fail_time < AUTO_COOKIE_COOLDOWN_S):
+            raise
+        err = e
+    for b in AUTO_COOKIE_BROWSERS:
+        try:
+            result = run({'cookiesfrombrowser': (b,)})
+            _cookie_browser = b
+            return result
+        except Exception:
+            continue                            # browser missing / locked / not signed in
+    _cookie_fail_time = time.monotonic()
+    raise err
+
+
 def _make_track(vid, title, dur):
-    return (vid, title or 'Unknown Track', fmt_time(dur) if dur else '--:--')
+    """(video_id, title, duration_str, duration_seconds)"""
+    return (vid, title or 'Unknown Track', fmt_time(dur) if dur else '--:--', int(dur or 0))
 
 
 def _playlist_exe(url):
     out = _run_exe(["--flat-playlist", "--ignore-errors", "--no-warnings", "--no-cache-dir",
-                    "--socket-timeout", "15", "--print", "%(id)s|%(duration)s|%(title)s", url], 180)
+                    "--socket-timeout", "15", *_COOKIE_ARGS,
+                    "--print", "%(id)s|%(duration)s|%(title)s", url], 180)
     tracks = []
     for line in out.splitlines():
         parts = line.split("|", 2)
@@ -304,8 +390,12 @@ def _playlist_exe(url):
 def _playlist_inproc(url):
     yt = get_ytdlp()
     tracks = []
-    with yt.YoutubeDL(dict(PLAYLIST_OPTS)) as ydl:
-        info = ydl.extract_info(url, download=False)
+
+    def run(extra):
+        with yt.YoutubeDL(dict(PLAYLIST_OPTS, **extra)) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    info = _with_cookie_fallback(run)
     if info:
         entries = info.get('entries')
         if entries is None:                   # single video link
@@ -322,21 +412,25 @@ def _playlist_inproc(url):
 
 def _stream_exe(url):
     out = _run_exe(["-f", "bestaudio/best", "--no-playlist", "--no-warnings", "--no-cache-dir",
-                    "--socket-timeout", "15", "-g", url], 90)
+                    "--socket-timeout", "15", *_COOKIE_ARGS, "-g", url], 90)
     lines = out.splitlines()
     return lines[0].strip() if lines else ''
 
 
 def _stream_inproc(url):
-    global _stream_ydl
-    try:
-        if _stream_ydl is None:
-            _stream_ydl = get_ytdlp().YoutubeDL(dict(STREAM_OPTS))
-        info = _stream_ydl.extract_info(url, download=False)
-        return (info or {}).get('url', '') or ''
-    except Exception:
-        _stream_ydl = None                    # rebuild on next attempt
-        raise
+    def run(extra):
+        key = extra.get('cookiesfrombrowser')
+        try:
+            ydl = _stream_ydls.get(key)
+            if ydl is None:
+                ydl = _stream_ydls[key] = get_ytdlp().YoutubeDL(dict(STREAM_OPTS, **extra))
+            info = ydl.extract_info(url, download=False)
+            return (info or {}).get('url', '') or ''
+        except Exception:
+            _stream_ydls.pop(key, None)       # rebuild on next attempt
+            raise
+
+    return _with_cookie_fallback(run)
 
 
 def fetch_playlist(bridge, req, url):
@@ -356,9 +450,16 @@ def fetch_stream(bridge, req, url):
         with _stream_lock:                    # one resolve at a time; re-check after waiting
             if req == bridge.stream_req:
                 stream = _stream_exe(url) if USE_EXE else _stream_inproc(url)
-    except Exception:
+    except Exception as e:
         stream = ''
-    bridge.stream_ready.emit(req, stream)
+        if _is_bot_error(e):
+            bridge.auth_blocked = True
+    if stream:
+        bridge.auth_blocked = False
+    offline = False
+    if not stream and req == bridge.stream_req:
+        offline = not _is_online()            # tells "no internet" apart from "bad video"
+    bridge.stream_ready.emit(req, stream, offline)
 
 
 # ----------------------------------------------------------------- track list model
@@ -368,7 +469,7 @@ class TrackModel(QAbstractListModel):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.tracks = []            # (video_id, title, duration_str)
+        self.tracks = []            # (video_id, title, duration_str, duration_sec)
         self.message = ""
         self.hl_row = -1
         self.hl_brush = None
@@ -384,7 +485,7 @@ class TrackModel(QAbstractListModel):
         r = index.row()
         if role == Qt.ItemDataRole.DisplayRole:
             if self.tracks:
-                _vid, title, dur = self.tracks[r]
+                _vid, title, dur = self.tracks[r][:3]
                 return f"{r + 1:02d}. {title} [{dur}]"
             return self.message
         if role == Qt.ItemDataRole.ForegroundRole and r == self.hl_row and self.hl_brush is not None:
@@ -869,7 +970,7 @@ class AudioPlayer(QWidget):
         self.playlists = self._load_playlists()
 
         self.current_playlist_name = ""
-        self.tracks = []            # tracks shown in the list: (id, title, duration_str)
+        self.tracks = []            # tracks shown in the list: (id, title, duration_str, duration_sec)
         self.queue = []             # tracks actually being played (kept when browsing other playlists)
         self.current_index = -1
         self.is_repeating = self.settings.value("repeat", False, type=bool)
@@ -877,9 +978,23 @@ class AudioPlayer(QWidget):
         self._shuffle_bag = []
         self._shuffle_history = []
         self.sidebar_expanded = True
-        self._resume_ms = 0
-        self._retries = 0
-        self._last_retry_pos = 0
+
+        # --- playback / recovery state
+        self._resume_ms = 0             # position to seek to once the new stream has loaded
+        self._resume_floor = 0          # ignore positions below this until the resume seek lands
+        self._resume_base = 0           # position where the current (re)start began
+        self._last_pos = 0              # last real playback position (survives player resets)
+        self._expected_ms = 0           # real track length according to yt-dlp
+        self._watch_pos = -1
+        self._last_progress = time.monotonic()
+        self._load_started = time.monotonic()
+        self._active = False            # a track is supposed to be playing
+        self._resolving = False         # waiting for yt-dlp to give us a stream URL
+        self._loading = False           # source set, playback not yet confirmed
+        self._end_handled = False       # guards against double "track ended" handling
+        self._fail_count = 0
+        self._skip_streak = 0
+
         self._last_sec = -1
         self._rainbow_ticks = 0
         self._bg_path = QPainterPath()      # rebuilt only on resize
@@ -902,6 +1017,15 @@ class AudioPlayer(QWidget):
         self.rainbow_timer = QTimer(self)
         self.rainbow_timer.setInterval(200)
         self.rainbow_timer.timeout.connect(self._rainbow_tick)
+
+        self._retry_timer = QTimer(self)
+        self._retry_timer.setSingleShot(True)
+        self._retry_timer.timeout.connect(self._do_retry)
+
+        self._watchdog = QTimer(self)
+        self._watchdog.setInterval(1000)
+        self._watchdog.timeout.connect(self._watchdog_tick)
+        self._watchdog.start()
 
         self.setup_window()
         self.enable_window_blur_and_corners()
@@ -1158,6 +1282,9 @@ class AudioPlayer(QWidget):
         super().resizeEvent(event)
 
     def closeEvent(self, event):
+        self._active = False
+        self._watchdog.stop()
+        self._retry_timer.stop()
         self.media_player.stop()
         self.settings.setValue("volume", self.audio_output.volume())
         self.settings.sync()
@@ -1410,6 +1537,7 @@ class AudioPlayer(QWidget):
         row = index.row()
         if self.tracks and 0 <= row < len(self.tracks):
             self.queue = self.tracks
+            self._skip_streak = 0
             self._reset_shuffle()
             self.play_track(row)
 
@@ -1419,76 +1547,195 @@ class AudioPlayer(QWidget):
         if not (0 <= index < len(self.queue)):
             return
         if not retry:
-            self._retries = 0
+            self._fail_count = 0
+        self._retry_timer.stop()
         self._clear_glow()
         self.current_index = index
+        track = self.queue[index]
+        vid, title = track[0], track[1]
+        self._expected_ms = track[3] * 1000 if len(track) > 3 else 0
         self._resume_ms = resume_ms
+        self._resume_floor = resume_ms      # ignore bogus 0:00 positions until the seek lands
+        self._resume_base = resume_ms
+        self._last_pos = resume_ms
+        self._watch_pos = -1
+        self._last_progress = time.monotonic()
+        self._load_started = time.monotonic()
+        self._end_handled = False
+        self._active = True
+        self._resolving = True
+        self._loading = True
         if self.queue is self.tracks:
             self.playlist_widget.setCurrentIndex(self.track_model.index(index, 0))
-        vid, title, _dur = self.queue[index]
-        self.now_label.setText(f"Loading: {title}")
+        self.now_label.setText(("Reconnecting: " if retry else "Loading: ") + title)
         self.bridge.stream_req += 1
         threading.Thread(target=fetch_stream,
                          args=(self.bridge, self.bridge.stream_req,
                                f"https://www.youtube.com/watch?v={vid}"),
                          daemon=True).start()
 
-    def start_stream(self, req, stream_url):
+    def start_stream(self, req, stream_url, offline=False):
         if req != self.bridge.stream_req:
             return
+        self._resolving = False
         if not stream_url:
-            self._retry_current(self._resume_ms)
+            self._on_resolve_failed(offline)
             return
         if 0 <= self.current_index < len(self.queue):
             self.now_label.setText(self.queue[self.current_index][1])
+        now = time.monotonic()
+        self._load_started = now
+        self._last_progress = now
         self.media_player.setSource(QUrl(stream_url))
         self.media_player.play()
 
-    def _retry_current(self, pos=None):
-        """Re-resolve the stream URL (they expire / sockets drop) and resume where we were."""
-        if self._retries >= MAX_RETRIES or self.current_index < 0:
-            self.now_label.setText("Error: stream unavailable")
-            self.media_player.stop()
+    # ---- recovery
+
+    def _is_near_end(self, pos):
+        lengths = [x for x in (self.media_player.duration(), self._expected_ms) if x > 0]
+        return bool(lengths) and pos >= min(lengths) - END_TOLERANCE_MS
+
+    def _schedule_retry(self, ms):
+        if not self._retry_timer.isActive():
+            self._retry_timer.start(ms)
+
+    def _do_retry(self):
+        if self._active and 0 <= self.current_index < len(self.queue):
+            self.play_track(self.current_index, resume_ms=self._last_pos, retry=True)
+
+    def _on_resolve_failed(self, offline):
+        if self.current_index < 0:
             return
-        self._retries += 1
-        if pos is None:
-            pos = self.media_player.position()
-        self._last_retry_pos = pos
-        self.play_track(self.current_index, resume_ms=pos, retry=True)
+        if self.bridge.auth_blocked and not offline:
+            # retrying cannot fix a bot check; stop and say what to do
+            self.now_label.setText("YouTube blocked this: sign in to YouTube in Firefox/Chrome, or add cookies.txt")
+            self._active = False
+            self._retry_timer.stop()
+            return
+        if offline:                         # no internet: keep polling, never give up
+            self.now_label.setText("Waiting for connection...")
+            self._schedule_retry(OFFLINE_POLL_MS)
+            return
+        self._fail_count += 1
+        if self._fail_count >= MAX_RETRIES:
+            self._give_up_track()
+        else:
+            self._schedule_retry(RETRY_DELAYS[min(self._fail_count - 1, len(RETRY_DELAYS) - 1)])
+
+    def _recover(self):
+        """Stream died, stalled or errored. Finish the song if it was basically over,
+        otherwise reconnect and resume from the last real position."""
+        if (not self._active or self._resolving or self._end_handled
+                or self._retry_timer.isActive()):
+            return
+        if self._is_near_end(self._last_pos):
+            self._handle_track_end()
+            return
+        self._fail_count += 1
+        if self._fail_count >= MAX_RETRIES:
+            self._give_up_track()
+            return
+        self.now_label.setText("Reconnecting...")
+        self._schedule_retry(RETRY_DELAYS[min(self._fail_count - 1, len(RETRY_DELAYS) - 1)])
+
+    def _give_up_track(self):
+        self._skip_streak += 1
+        n = len(self.queue)
+        if n > 1 and self._skip_streak < min(n, 5):
+            self.now_label.setText("Track unavailable, skipping...")
+            self.play_next()
+        else:
+            self.now_label.setText("Error: stream unavailable")
+            self._active = False
+            self.media_player.stop()
+
+    def _handle_track_end(self):
+        if self._end_handled or not self._active:
+            return
+        self._end_handled = True
+        if self.is_repeating and self.current_index >= 0:
+            self._end_handled = False
+            self._last_pos = 0
+            self._resume_floor = 0
+            self._resume_base = 0
+            self._last_progress = time.monotonic()
+            self.media_player.setPosition(0)
+            self.media_player.play()
+        else:
+            self.play_next()
+
+    def _check_stopped(self):
+        if (not self._active or self._resolving or self._loading or self._end_handled
+                or self._retry_timer.isActive()):
+            return
+        if self.media_player.playbackState() != QMediaPlayer.PlaybackState.StoppedState:
+            return
+        if self._is_near_end(self._last_pos):
+            self._handle_track_end()
+        else:
+            self._recover()
+
+    def _watchdog_tick(self):
+        """1 Hz safety net: catches missing end-of-track events, frozen streams and hung loads."""
+        if (not self._active or self._resolving or self._end_handled
+                or self._retry_timer.isActive()):
+            return
+        now = time.monotonic()
+        state = self.media_player.playbackState()
+        PS = QMediaPlayer.PlaybackState
+        if state == PS.PausedState:         # paused by the user: nothing to watch
+            self._last_progress = now
+            self._load_started = now
+            return
+        if self._loading:
+            if now - self._load_started > LOAD_TIMEOUT_S:
+                self._recover()
+            return
+        if state != PS.PlayingState:
+            self._last_progress = now
+            return
+        stalled = now - self._last_progress
+        if stalled > 2.5 and self._is_near_end(self._last_pos):
+            self._handle_track_end()        # EndOfMedia never arrived, but the song is over
+        elif stalled > STALL_TIMEOUT_S:
+            self._recover()
 
     def on_player_error(self, error, message=""):
         if error != QMediaPlayer.Error.NoError:
-            self._retry_current()
+            self._recover()
 
     def on_media_status(self, status):
         MS = QMediaPlayer.MediaStatus
-        if status in (MS.LoadedMedia, MS.BufferedMedia) and self._resume_ms > 0:
-            self.media_player.setPosition(self._resume_ms)
-            self._resume_ms = 0
+        if self._resolving:
+            return                          # events from the previous source
+        if status in (MS.LoadedMedia, MS.BufferedMedia):
+            if self._resume_ms > 0:
+                self.media_player.setPosition(self._resume_ms)
+                self._resume_ms = 0
         elif status == MS.EndOfMedia:
-            dur = self.media_player.duration()
-            pos = self.media_player.position()
-            # Ended far too early => the connection dropped, not a real end of track
-            if dur > 0 and pos < dur - 3000 and self._retries < MAX_RETRIES:
-                self._retry_current(pos)
-                return
-            if self.is_repeating and self.current_index >= 0:
-                self.media_player.setPosition(0)
-                self.media_player.play()
+            has_length = self.media_player.duration() > 0 or self._expected_ms > 0
+            if self._is_near_end(self._last_pos) or not has_length:
+                self._handle_track_end()
             else:
-                self.play_next()
+                self._recover()             # stream was cut short
+        elif status == MS.InvalidMedia:
+            self._recover()
 
     def on_playback_state(self, state):
-        playing = state == QMediaPlayer.PlaybackState.PlayingState
+        PS = QMediaPlayer.PlaybackState
+        playing = state == PS.PlayingState
         self.btn_play.set_icon('pause' if playing else 'play')
         self.btn_play.set_active(playing)
         self.visualizer.set_playing(playing)
         if playing:
+            self._last_progress = time.monotonic()
             if not self.glow_timer.isActive():
                 self.glow_timer.start()
         else:
             self.glow_timer.stop()
             self._clear_glow()
+            if state == PS.StoppedState and self._active:
+                QTimer.singleShot(700, self._check_stopped)
 
     def toggle_play(self):
         state = self.media_player.playbackState()
@@ -1497,9 +1744,11 @@ class AudioPlayer(QWidget):
         elif state == QMediaPlayer.PlaybackState.PausedState:
             self.media_player.play()
         elif self.queue and self.current_index >= 0:
+            self._skip_streak = 0
             self.play_track(self.current_index)
         elif self.tracks:
             self.queue = self.tracks
+            self._skip_streak = 0
             self._reset_shuffle()
             self.play_track(0)
 
@@ -1579,24 +1828,41 @@ class AudioPlayer(QWidget):
         dur = self.media_player.duration()
         if dur <= 0:
             return
-        self.media_player.setPosition(max(0, min(dur, self.media_player.position() + ms)))
+        target = max(0, min(dur, self.media_player.position() + ms))
+        self._last_pos = target
+        self._resume_floor = 0
+        self.media_player.setPosition(target)
 
     def on_slider_moved(self, value):
         self.time_current.setText(fmt_time(value // 1000))
 
     def on_slider_released(self):
-        self.media_player.setPosition(self.progress_slider.value())
+        target = self.progress_slider.value()
+        self._last_pos = target
+        self._resume_floor = 0
+        self.media_player.setPosition(target)
 
     def update_position(self, position):
+        if position != self._watch_pos:
+            self._watch_pos = position
+            self._last_progress = time.monotonic()
+        if position > 0:
+            self._loading = False
+        # after a reconnect, ignore the temporary 0:00 until the resume seek lands
+        if position + 3000 >= self._resume_floor:
+            self._last_pos = position
+            self._resume_floor = 0
         if not self.progress_slider.isSliderDown():
             self.progress_slider.setValue(position)
             sec = position // 1000
             if sec != self._last_sec:
                 self._last_sec = sec
                 self.time_current.setText(fmt_time(sec))
-        # playback has been stable for a while -> forgive earlier retries
-        if self._retries and position - self._last_retry_pos > 15000:
-            self._retries = 0
+        # played steadily for 8 s past the last (re)start -> forgive earlier failures
+        if ((self._fail_count or self._skip_streak) and self._resume_floor == 0
+                and self._last_pos - self._resume_base > 8000):
+            self._fail_count = 0
+            self._skip_streak = 0
 
     def update_duration(self, duration):
         self.progress_slider.setRange(0, max(0, duration))
