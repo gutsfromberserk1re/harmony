@@ -1,6 +1,25 @@
 import sys
 import os
 
+# A --windowed PyInstaller build has no console: sys.stdout / sys.stderr are None, and yt-dlp
+# crashes the moment it tries to print an error. Give them a real target (a small log file).
+_LOG_PATH = ""
+try:
+    _log_dir = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "Harmony")
+    os.makedirs(_log_dir, exist_ok=True)
+    _LOG_PATH = os.path.join(_log_dir, "harmony.log")
+    if os.path.exists(_LOG_PATH) and os.path.getsize(_LOG_PATH) > 512 * 1024:
+        os.remove(_LOG_PATH)                # keep it small
+except Exception:
+    _LOG_PATH = ""
+for _name in ("stdout", "stderr"):
+    if getattr(sys, _name) is None:
+        try:
+            setattr(sys, _name, open(_LOG_PATH or os.devnull, "a", encoding="utf-8",
+                                     errors="replace", buffering=1))
+        except Exception:
+            setattr(sys, _name, open(os.devnull, "w"))
+
 os.environ["YTDLP_NO_LAZY_EXTRACTORS"] = "1"    # must be set before yt_dlp is imported
 os.environ.setdefault("QT_LOGGING_RULES", "qt.multimedia.*=false")
 
@@ -50,7 +69,7 @@ COOKIES_BROWSER = ""            # OPTIONAL manual override: "firefox", "chrome",
 AUTO_COOKIE_BROWSERS = ("firefox", "chrome", "edge", "brave")
 AUTO_COOKIE_COOLDOWN_S = 600    # after every browser failed, don't retry the fallback for this long
 
-DISCORD_CLIENT_ID = "1559860475662176308"          # Discord "Application ID" (discord.com/developers/applications). "" = Discord status off
+DISCORD_CLIENT_ID = ""          # Discord "Application ID" (discord.com/developers/applications). "" = Discord status off
 DISCORD_ICON_KEY = "harmony"    # name of the icon you upload under Rich Presence > Art Assets
 USE_YTDLP_EXE = False           # True = run a bundled yt-dlp.exe as a subprocess (lowest RAM, slower track start)
 
@@ -161,6 +180,23 @@ def _is_online(timeout=1.2):
         threading.Thread(target=probe, args=(a,), daemon=True).start()
     done.wait(timeout + 0.3)
     return bool(result)
+
+
+_last_error = ""
+
+
+def _set_error(e):
+    """Remember the last yt-dlp failure (shown in the UI) and append it to the log file."""
+    global _last_error
+    _last_error = f"{type(e).__name__}: {e}".replace("\n", " ")
+    try:
+        if _LOG_PATH:
+            import traceback
+            with open(_LOG_PATH, "a", encoding="utf-8", errors="replace") as f:
+                f.write(time.strftime("[%Y-%m-%d %H:%M:%S] ") + _last_error + "\n")
+                f.write("".join(traceback.format_exception(type(e), e, e.__traceback__))[-1500:] + "\n")
+    except Exception:
+        pass
 
 
 _ws_ready = False
@@ -437,11 +473,14 @@ def _stream_inproc(url):
 
 
 def fetch_playlist(bridge, req, url):
+    global _last_error
     tracks = []
     if req == bridge.playlist_req:            # skip if the user already clicked something else
+        _last_error = ""
         try:
             tracks = _playlist_exe(url) if USE_EXE else _playlist_inproc(url)
-        except Exception:
+        except Exception as e:
+            _set_error(e)
             tracks = []
     bridge.playlist_ready.emit(req, tracks)
     gc.collect()
@@ -455,6 +494,7 @@ def fetch_stream(bridge, req, url):
                 stream = _stream_exe(url) if USE_EXE else _stream_inproc(url)
     except Exception as e:
         stream = ''
+        _set_error(e)
         if _is_bot_error(e):
             bridge.auth_blocked = True
     if stream:
@@ -1107,6 +1147,11 @@ class AudioPlayer(QWidget):
         self._fail_count = 0
         self._skip_streak = 0
         self.queue_playlist = ""        # name of the playlist the queue came from (for Discord)
+        self._allow_jump_until = 0.0    # until then a backwards position jump is a real seek
+        self._guard_time = 0.0
+        self._guard_count = 0
+        self._resume_tries = 0
+        self._resume_try_time = 0.0
 
         self._last_sec = -1
         self._rainbow_ticks = 0
@@ -1662,7 +1707,8 @@ class AudioPlayer(QWidget):
             return
         self.tracks = tracks
         self.track_model.set_tracks(
-            tracks, "" if tracks else "No tracks found or error loading playlist.")
+            tracks, "" if tracks else
+            "No tracks found or error loading playlist." + (f" ({_last_error[:90]})" if _last_error else ""))
         QTimer.singleShot(800, trim_memory)
 
     def on_track_selected(self, index):
@@ -1696,6 +1742,10 @@ class AudioPlayer(QWidget):
         self._load_started = time.monotonic()
         self._end_handled = False
         self._user_paused = False
+        self._guard_count = 0
+        self._resume_tries = 0
+        self._resume_try_time = 0.0
+        self._allow_jump_until = time.monotonic() + 3
         self._active = True
         self._resolving = True
         self._loading = True
@@ -1785,7 +1835,7 @@ class AudioPlayer(QWidget):
             self.now_label.setText("Track unavailable, skipping...")
             self.play_next()
         else:
-            self.now_label.setText("Error: stream unavailable")
+            self.now_label.setText("Error: " + (_last_error[:90] or "stream unavailable"))
             self._active = False
             self.media_player.stop()
 
@@ -1795,6 +1845,7 @@ class AudioPlayer(QWidget):
         self._end_handled = True
         if self.is_repeating and self.current_index >= 0:
             self._end_handled = False
+            self._allow_jump_until = time.monotonic() + 3
             self._last_pos = 0
             self._resume_floor = 0
             self._resume_base = 0
@@ -1814,7 +1865,7 @@ class AudioPlayer(QWidget):
     def _rebind_audio(self):
         try:
             default = QMediaDevices.defaultAudioOutput()
-            if self.audio_output.device() != default:
+            if bytes(self.audio_output.device().id()) != bytes(default.id()):
                 self.audio_output.setDevice(default)
         except Exception:
             pass
@@ -1853,6 +1904,17 @@ class AudioPlayer(QWidget):
             self._last_progress = now
             self._load_started = now
             return
+        MS = QMediaPlayer.MediaStatus
+        if (self._resume_ms > 0 and state == PS.PlayingState
+                and self.media_player.mediaStatus() in (MS.LoadedMedia, MS.BufferedMedia)
+                and now - self._resume_try_time > 2.0):
+            if self._resume_tries < 6:      # the seek didn't stick (song would restart): try again
+                self._resume_tries += 1
+                self._resume_try_time = now
+                self.media_player.setPosition(self._resume_ms)
+            else:
+                self._resume_ms = 0
+                self._resume_floor = 0
         if self._loading:
             if now - self._load_started > LOAD_TIMEOUT_S:
                 self._recover()
@@ -1875,9 +1937,9 @@ class AudioPlayer(QWidget):
         if self._resolving:
             return                          # events from the previous source
         if status in (MS.LoadedMedia, MS.BufferedMedia):
-            if self._resume_ms > 0:
+            if self._resume_ms > 0:         # cleared in update_position once the seek has landed
                 self.media_player.setPosition(self._resume_ms)
-                self._resume_ms = 0
+                self._resume_try_time = time.monotonic()
         elif status == MS.EndOfMedia:
             has_length = self.media_player.duration() > 0 or self._expected_ms > 0
             if self._is_near_end(self._last_pos) or not has_length:
@@ -2043,6 +2105,7 @@ class AudioPlayer(QWidget):
         if dur <= 0:
             return
         target = max(0, min(dur, self.media_player.position() + ms))
+        self._allow_jump_until = time.monotonic() + 3
         self._last_pos = target
         self._resume_floor = 0
         self.media_player.setPosition(target)
@@ -2053,6 +2116,7 @@ class AudioPlayer(QWidget):
 
     def on_slider_released(self):
         target = self.progress_slider.value()
+        self._allow_jump_until = time.monotonic() + 3
         self._last_pos = target
         self._resume_floor = 0
         self.media_player.setPosition(target)
@@ -2065,8 +2129,22 @@ class AudioPlayer(QWidget):
         if position > 0:
             self._loading = False
         # after a reconnect, ignore the temporary 0:00 until the resume seek lands
+        now = time.monotonic()
+        glitch = False
+        if (self._resume_ms == 0 and self._last_pos > 8000 and position + 5000 < self._last_pos
+                and now > self._allow_jump_until and not self.progress_slider.isSliderDown()):
+            # position fell back by itself (stream reopened and started over): jump back, don't restart
+            glitch = self._guard_count < 5
+            if (glitch and now - self._guard_time > 2.0
+                    and self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState):
+                self._guard_time = now
+                self._guard_count += 1
+                self.media_player.setPosition(self._last_pos)
+        if self._resume_ms > 0 and position + 3000 >= self._resume_ms:
+            self._resume_ms = 0             # resume seek has landed
         # a sudden 0:00 is the player resetting itself (device lost, stop), not real progress
-        if position + 3000 >= self._resume_floor and not (position == 0 and self._last_pos > 3000):
+        if (not glitch and position + 3000 >= self._resume_floor
+                and not (position == 0 and self._last_pos > 3000)):
             self._last_pos = position
             self._resume_floor = 0
         if not self.progress_slider.isSliderDown():
